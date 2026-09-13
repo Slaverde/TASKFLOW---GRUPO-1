@@ -1,149 +1,219 @@
 import { useState, useEffect, useCallback } from 'react'
-
-const STORAGE_KEY = 'taskflow_data'
+import { supabase } from '@/lib/supabase'
 
 const DEFAULT_CATEGORIES = [
-  { id: 'cat-universidad', name: 'Universidad', color: 'blue'    },
-  { id: 'cat-personal',    name: 'Personal',    color: 'emerald' },
-  { id: 'cat-trabajo',     name: 'Trabajo',     color: 'amber'   },
+  { name: 'Universidad', color: 'blue'    },
+  { name: 'Personal',    color: 'emerald' },
+  { name: 'Trabajo',     color: 'amber'   },
 ]
 
-const DEFAULT_DATA = {
-  tasks: [],
-  categories: DEFAULT_CATEGORIES,
-  settings: { currentSort: 'manual' },
-  calendarEvents: [],
-}
+const fromTaskRow = (r) => ({
+  id: r.id,
+  title: r.title,
+  description: r.description,
+  dueDate: r.due_date,
+  priority: r.priority,
+  category: r.category,
+  completed: r.completed,
+  order: r.order,
+  createdAt: r.created_at,
+  subtasks: r.subtasks ?? [],
+})
 
-function loadFromStorage() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return DEFAULT_DATA
-    const parsed = JSON.parse(raw)
-    return {
-      tasks: parsed.tasks ?? [],
-      categories: parsed.categories?.length ? parsed.categories : DEFAULT_CATEGORIES,
-      settings: parsed.settings ?? { currentSort: 'manual' },
-      calendarEvents: parsed.calendarEvents ?? [],
-    }
-  } catch {
-    return DEFAULT_DATA
-  }
-}
+const fromEventRow = (r) => ({
+  id: r.id,
+  title: r.title,
+  date: r.date,
+  startTime: r.start_time,
+  endTime: r.end_time,
+  color: r.color,
+  description: r.description ?? undefined,
+})
 
-function saveToStorage(data) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
-  } catch {
-    // almacenamiento no disponible (modo privado, cuota llena, etc.) — se ignora
-  }
-}
+export function useTaskFlow(user) {
+  const [tasks,          setTasks]          = useState([])
+  const [categories,     setCategories]     = useState([])
+  const [settings,       setSettings]       = useState({ currentSort: 'manual' })
+  const [calendarEvents, setCalendarEvents] = useState([])
+  const [loading,        setLoading]        = useState(true)
 
-const uid = () => crypto.randomUUID()
-
-// Versión local (Etapa 1): persiste todo en localStorage, sin backend.
-// La interfaz (nombres y forma de los datos) es la misma que usará la
-// versión con Supabase de la Etapa 2, para que el resto de componentes
-// no tengan que cambiar cuando se reemplace este hook.
-export function useTaskFlow(_user) {
-  const [data,    setData]    = useState(DEFAULT_DATA)
-  const [loading, setLoading] = useState(true)
-
+  // ─── Load data ────────────────────────────────────────────────────────────
   useEffect(() => {
-    setData(loadFromStorage())
-    setLoading(false)
-  }, [])
+    let cancelled = false
+    async function load() {
+      setLoading(true)
+      try {
+        const [taskRes, catRes, settingsRes, eventRes] = await Promise.all([
+          supabase.from('tasks').select('*').eq('user_id', user.id).order('order'),
+          supabase.from('categories').select('*').eq('user_id', user.id),
+          supabase.from('settings').select('*').eq('user_id', user.id).maybeSingle(),
+          supabase.from('calendar_events').select('*').eq('user_id', user.id),
+        ])
 
-  // Actualiza el estado y persiste el resultado en localStorage.
-  const update = useCallback((updater) => {
-    setData(prev => {
-      const next = { ...prev, ...updater(prev) }
-      saveToStorage(next)
-      return next
-    })
-  }, [])
+        if (cancelled) return
+        if (taskRes.error) throw taskRes.error
+        if (catRes.error) throw catRes.error
+        if (eventRes.error) throw eventRes.error
+
+        const loadedTasks = taskRes.data.map(fromTaskRow)
+        let loadedCats = catRes.data.map(
+          ({ id, name, color }) => ({ id, name, color })
+        )
+
+        if (loadedCats.length === 0) {
+          const { data: inserted, error } = await supabase
+            .from('categories')
+            .insert(DEFAULT_CATEGORIES.map(c => ({ ...c, user_id: user.id })))
+            .select()
+          if (error) throw error
+          loadedCats = inserted.map(
+            ({ id, name, color }) => ({ id, name, color })
+          )
+        }
+
+        let loadedSettings = { currentSort: 'manual' }
+        if (settingsRes.data) {
+          loadedSettings = {
+            currentSort: settingsRes.data.current_sort,
+          }
+        } else {
+          await supabase.from('settings').insert({
+            user_id: user.id,
+            current_sort: loadedSettings.currentSort,
+          })
+        }
+
+        const loadedEvents = eventRes.data.map(fromEventRow)
+
+        setTasks(loadedTasks)
+        setCategories(loadedCats)
+        setSettings(loadedSettings)
+        setCalendarEvents(loadedEvents)
+      } catch {
+        setTasks([])
+        setCategories(DEFAULT_CATEGORIES.map((c, i) => ({ id: String(i), ...c })))
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    load()
+    return () => { cancelled = true }
+  }, [user.id])
 
   // ─── Tasks CRUD ───────────────────────────────────────────────────────────
   const createTask = useCallback(async (payload) => {
-    update(prev => ({
-      tasks: [...prev.tasks, {
-        id: uid(),
-        title: payload.title,
-        description: payload.description,
-        dueDate: payload.dueDate,
-        priority: payload.priority,
-        category: payload.category,
-        subtasks: payload.subtasks ?? [],
-        completed: false,
-        order: prev.tasks.length,
-        createdAt: new Date().toISOString(),
-      }],
-    }))
-  }, [update])
+    const { data, error } = await supabase.from('tasks').insert({
+      user_id: user.id,
+      title: payload.title,
+      description: payload.description,
+      due_date: payload.dueDate,
+      priority: payload.priority,
+      category: payload.category,
+      subtasks: payload.subtasks,
+      completed: false,
+      order: tasks.length,
+    }).select().single()
+    if (error) throw error
+    setTasks(prev => [...prev, fromTaskRow(data)])
+  }, [tasks.length, user.id])
 
   const updateTask = useCallback(async (id, payload) => {
-    update(prev => ({
-      tasks: prev.tasks.map(t => t.id === id ? { ...t, ...payload } : t),
-    }))
-  }, [update])
+    const patch = {}
+    if (payload.title !== undefined)       patch.title = payload.title
+    if (payload.description !== undefined) patch.description = payload.description
+    if (payload.dueDate !== undefined)     patch.due_date = payload.dueDate
+    if (payload.priority !== undefined)    patch.priority = payload.priority
+    if (payload.category !== undefined)    patch.category = payload.category
+    if (payload.completed !== undefined)   patch.completed = payload.completed
+    if (payload.order !== undefined)       patch.order = payload.order
+    if (payload.subtasks !== undefined)    patch.subtasks = payload.subtasks
+
+    const { error } = await supabase.from('tasks').update(patch).eq('id', id)
+    if (error) throw error
+    setTasks(prev => prev.map(t => t.id === id ? { ...t, ...payload } : t))
+  }, [])
 
   const deleteTask = useCallback(async (id) => {
-    update(prev => ({ tasks: prev.tasks.filter(t => t.id !== id) }))
-  }, [update])
+    const { error } = await supabase.from('tasks').delete().eq('id', id)
+    if (error) throw error
+    setTasks(prev => prev.filter(t => t.id !== id))
+  }, [])
 
   const reorderTasks = useCallback(async (reordered) => {
-    update(() => ({ tasks: reordered }))
-  }, [update])
+    setTasks(reordered)
+    await Promise.all(
+      reordered.map((t, i) => supabase.from('tasks').update({ order: i }).eq('id', t.id))
+    )
+  }, [])
 
   const toggleComplete = useCallback(async (id) => {
-    update(prev => ({
-      tasks: prev.tasks.map(t => t.id === id ? { ...t, completed: !t.completed } : t),
-    }))
-  }, [update])
+    const task = tasks.find(t => t.id === id)
+    if (!task) return
+    const completed = !task.completed
+    setTasks(prev => prev.map(t => t.id === id ? { ...t, completed } : t))
+    const { error } = await supabase.from('tasks').update({ completed }).eq('id', id)
+    if (error) setTasks(prev => prev.map(t => t.id === id ? { ...t, completed: !completed } : t))
+  }, [tasks])
 
   // ─── Categories CRUD ──────────────────────────────────────────────────────
   const createCategory = useCallback(async (name, color) => {
-    const cat = { id: uid(), name, color }
-    update(prev => ({ categories: [...prev.categories, cat] }))
+    const { data, error } = await supabase.from('categories')
+      .insert({ user_id: user.id, name, color }).select().single()
+    if (error) throw error
+    const cat = { id: data.id, name, color }
+    setCategories(prev => [...prev, cat])
     return cat
-  }, [update])
+  }, [user.id])
 
   // ─── Calendar Events CRUD ─────────────────────────────────────────────────
   const createCalendarEvent = useCallback(async (payload) => {
-    const event = {
-      id: uid(),
+    const { data, error } = await supabase.from('calendar_events').insert({
+      user_id: user.id,
       title: payload.title,
       date: payload.date,
-      startTime: payload.startTime,
-      endTime: payload.endTime,
+      start_time: payload.startTime,
+      end_time: payload.endTime,
       color: payload.color,
-      description: payload.description ?? undefined,
-    }
-    update(prev => ({ calendarEvents: [...prev.calendarEvents, event] }))
+      description: payload.description ?? null,
+    }).select().single()
+    if (error) throw error
+    const event = fromEventRow(data)
+    setCalendarEvents(prev => [...prev, event])
     return event
-  }, [update])
+  }, [user.id])
 
   const updateCalendarEvent = useCallback(async (id, payload) => {
-    update(prev => ({
-      calendarEvents: prev.calendarEvents.map(e => e.id === id ? { ...e, ...payload } : e),
-    }))
-  }, [update])
+    const patch = {}
+    if (payload.title !== undefined)       patch.title = payload.title
+    if (payload.date !== undefined)        patch.date = payload.date
+    if (payload.startTime !== undefined)   patch.start_time = payload.startTime
+    if (payload.endTime !== undefined)     patch.end_time = payload.endTime
+    if (payload.color !== undefined)       patch.color = payload.color
+    if (payload.description !== undefined) patch.description = payload.description
+
+    const { error } = await supabase.from('calendar_events').update(patch).eq('id', id)
+    if (error) throw error
+    setCalendarEvents(prev => prev.map(e => e.id === id ? { ...e, ...payload } : e))
+  }, [])
 
   const deleteCalendarEvent = useCallback(async (id) => {
-    update(prev => ({ calendarEvents: prev.calendarEvents.filter(e => e.id !== id) }))
-  }, [update])
+    const { error } = await supabase.from('calendar_events').delete().eq('id', id)
+    if (error) throw error
+    setCalendarEvents(prev => prev.filter(e => e.id !== id))
+  }, [])
 
   // ─── Settings ─────────────────────────────────────────────────────────────
   const saveSettings = useCallback(async (patch) => {
-    update(prev => ({ settings: { ...prev.settings, ...patch } }))
-  }, [update])
+    const updated = { ...settings, ...patch }
+    setSettings(updated)
+    await supabase.from('settings').upsert({
+      user_id: user.id,
+      current_sort: updated.currentSort,
+    })
+  }, [settings, user.id])
 
   return {
-    tasks: data.tasks,
-    categories: data.categories,
-    settings: data.settings,
-    calendarEvents: data.calendarEvents,
-    loading,
+    tasks, categories, settings, calendarEvents, loading,
     createTask, updateTask, deleteTask, reorderTasks, toggleComplete,
     createCategory, saveSettings,
     createCalendarEvent, updateCalendarEvent, deleteCalendarEvent,
