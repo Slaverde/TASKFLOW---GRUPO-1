@@ -1,18 +1,16 @@
 import { useState, useEffect, useMemo, useCallback } from 'react'
+import { supabase } from '@/lib/supabase'
 import { useTaskFlow } from '@/hooks/useTaskFlow'
 import { todayStr, PRIORITY_ORDER } from '@/lib/utils'
 import { SparklesCore } from '@/components/ui/sparkles'
-import Sidebar from '@/components/ui/Sidebar'
-import Header from '@/components/ui/Header'
-import TaskList from '@/components/ui/TaskList'
-import TaskPanel from '@/components/ui/TaskPanel'
+import LoginScreen from '@/components/LoginScreen'
+import Sidebar from '@/components/Sidebar'
+import Header from '@/components/Header'
+import TaskList from '@/components/TaskList'
+import TaskPanel from '@/components/TaskPanel'
 import CalendarWidget from '@/components/CalendarWidget'
 import WeeklyCalendar from '@/components/WeeklyCalendar'
-import BottomNav from '@/components/ui/BottomNav'
-
-// Usuario local: la versión de Etapa 1 no tiene autenticación, todo se
-// guarda en el navegador de quien use la app.
-const LOCAL_USER = { id: 'local', email: 'local@taskflow.app' }
+import BottomNav from '@/components/BottomNav'
 
 // ─── Loading spinner ───────────────────────────────────────────────────────────
 function LoadingOverlay() {
@@ -26,7 +24,7 @@ function LoadingOverlay() {
   )
 }
 
-// ─── Main app ──────────────────────────────────────────────────────────────────
+// ─── Main app (authenticated) ─────────────────────────────────────────────────
 function TaskFlowApp({ user }) {
   const {
     tasks, categories, settings, calendarEvents, loading,
@@ -159,7 +157,7 @@ function TaskFlowApp({ user }) {
         onCatFilter={id => { setCurrentCatFilter(id); setCurrentView('todas') }}
         onCreateCategory={createCategory}
         onClose={() => setSidebarOpen(false)}
-        onSignOut={() => {}}
+        onSignOut={() => supabase.auth.signOut()}
       />
 
       <main className="flex-1 flex flex-col min-h-screen min-w-0">
@@ -237,11 +235,30 @@ function TaskFlowApp({ user }) {
   )
 }
 
-// ─── Root App (Etapa 1: sin autenticación, un solo usuario local) ─────────────
+// ─── Root App with auth ────────────────────────────────────────────────────────
 export default function App() {
+  const [user,        setUser]        = useState(null)
+  const [authLoading, setAuthLoading] = useState(true)
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setUser(data.session?.user ?? null)
+      setAuthLoading(false)
+    })
+
+    const { data: subscription } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null)
+      setAuthLoading(false)
+    })
+
+    return () => subscription.subscription.unsubscribe()
+  }, [])
+
+  if (authLoading) return <LoadingOverlay />
+
   return (
     <div className="relative min-h-screen w-full overflow-hidden bg-surface">
-      <TaskFlowApp user={LOCAL_USER} />
+      {user ? <TaskFlowApp user={user} /> : <LoginScreen />}
     </div>
   )
 }
