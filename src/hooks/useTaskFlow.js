@@ -7,6 +7,50 @@ const DEFAULT_CATEGORIES = [
   { name: 'Trabajo',     color: 'amber'   },
 ]
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+function toCategoryId(value) {
+  if (value == null || value === '') return null
+  return UUID_RE.test(String(value)) ? value : null
+}
+
+function isAuthError(error) {
+  if (!error) return false
+  const status = error.status ?? error.statusCode
+  const code = String(error.code ?? '')
+  const message = String(error.message ?? '').toLowerCase()
+  return (
+    status === 401 ||
+    status === 403 ||
+    code === 'PGRST301' ||
+    code === '401' ||
+    message.includes('jwt') ||
+    message.includes('not authenticated')
+  )
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function ensureSession() {
+  for (let i = 0; i < 5; i++) {
+    const { data: { session } } = await supabase.auth.getSession()
+    if (session?.access_token) return session
+    await sleep(250 * (i + 1))
+  }
+  return null
+}
+
+async function queryWithRetry(fn, { retries = 4, delay = 350 } = {}) {
+  let last = await fn()
+  for (let i = 0; i < retries && last.error && isAuthError(last.error); i++) {
+    await sleep(delay * (i + 1))
+    last = await fn()
+  }
+  return last
+}
+
 const fromTaskRow = (r) => ({
   id: r.id,
   title: r.title,
@@ -43,32 +87,44 @@ export function useTaskFlow(user) {
     async function load() {
       setLoading(true)
       try {
+        await ensureSession()
+        if (cancelled) return
+
         const [taskRes, catRes, settingsRes, eventRes] = await Promise.all([
-          supabase.from('tasks').select('*').eq('user_id', user.id).order('order'),
-          supabase.from('categories').select('*').eq('user_id', user.id),
-          supabase.from('settings').select('*').eq('user_id', user.id).maybeSingle(),
-          supabase.from('calendar_events').select('*').eq('user_id', user.id),
+          queryWithRetry(() =>
+            supabase.from('tasks').select('*').eq('user_id', user.id).order('order')
+          ),
+          queryWithRetry(() =>
+            supabase.from('categories').select('*').eq('user_id', user.id)
+          ),
+          queryWithRetry(() =>
+            supabase.from('settings').select('*').eq('user_id', user.id).maybeSingle()
+          ),
+          queryWithRetry(() =>
+            supabase.from('calendar_events').select('*').eq('user_id', user.id)
+          ),
         ])
 
         if (cancelled) return
-        if (taskRes.error) throw taskRes.error
-        if (catRes.error) throw catRes.error
-        if (eventRes.error) throw eventRes.error
 
-        const loadedTasks = taskRes.data.map(fromTaskRow)
-        let loadedCats = catRes.data.map(
-          ({ id, name, color }) => ({ id, name, color })
-        )
+        const loadedTasks = !taskRes.error && Array.isArray(taskRes.data)
+          ? taskRes.data.map(fromTaskRow)
+          : []
 
-        if (loadedCats.length === 0) {
-          const { data: inserted, error } = await supabase
-            .from('categories')
-            .insert(DEFAULT_CATEGORIES.map(c => ({ ...c, user_id: user.id })))
-            .select()
-          if (error) throw error
-          loadedCats = inserted.map(
-            ({ id, name, color }) => ({ id, name, color })
+        let loadedCats = !catRes.error && Array.isArray(catRes.data)
+          ? catRes.data.map(({ id, name, color }) => ({ id, name, color }))
+          : []
+
+        if (!catRes.error && loadedCats.length === 0) {
+          const { data: inserted, error } = await queryWithRetry(() =>
+            supabase
+              .from('categories')
+              .insert(DEFAULT_CATEGORIES.map(c => ({ ...c, user_id: user.id })))
+              .select()
           )
+          if (!error && inserted?.length) {
+            loadedCats = inserted.map(({ id, name, color }) => ({ id, name, color }))
+          }
         }
 
         let loadedSettings = { currentSort: 'manual' }
@@ -76,14 +132,16 @@ export function useTaskFlow(user) {
           loadedSettings = {
             currentSort: settingsRes.data.current_sort,
           }
-        } else {
+        } else if (!settingsRes.error) {
           await supabase.from('settings').insert({
             user_id: user.id,
             current_sort: loadedSettings.currentSort,
           })
         }
 
-        const loadedEvents = eventRes.data.map(fromEventRow)
+        const loadedEvents = !eventRes.error && Array.isArray(eventRes.data)
+          ? eventRes.data.map(fromEventRow)
+          : []
 
         setTasks(loadedTasks)
         setCategories(loadedCats)
@@ -91,7 +149,7 @@ export function useTaskFlow(user) {
         setCalendarEvents(loadedEvents)
       } catch {
         setTasks([])
-        setCategories(DEFAULT_CATEGORIES.map((c, i) => ({ id: String(i), ...c })))
+        setCategories([])
       } finally {
         if (!cancelled) setLoading(false)
       }
@@ -108,7 +166,7 @@ export function useTaskFlow(user) {
       description: payload.description,
       due_date: payload.dueDate,
       priority: payload.priority,
-      category: payload.category,
+      category: toCategoryId(payload.category),
       subtasks: payload.subtasks,
       completed: false,
       order: tasks.length,
@@ -123,7 +181,7 @@ export function useTaskFlow(user) {
     if (payload.description !== undefined) patch.description = payload.description
     if (payload.dueDate !== undefined)     patch.due_date = payload.dueDate
     if (payload.priority !== undefined)    patch.priority = payload.priority
-    if (payload.category !== undefined)    patch.category = payload.category
+    if (payload.category !== undefined)    patch.category = toCategoryId(payload.category)
     if (payload.completed !== undefined)   patch.completed = payload.completed
     if (payload.order !== undefined)       patch.order = payload.order
     if (payload.subtasks !== undefined)    patch.subtasks = payload.subtasks
