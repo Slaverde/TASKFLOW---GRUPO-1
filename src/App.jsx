@@ -4,13 +4,13 @@ import { useTaskFlow } from '@/hooks/useTaskFlow'
 import { todayStr, PRIORITY_ORDER } from '@/lib/utils'
 import { SparklesCore } from '@/components/ui/sparkles'
 import LoginScreen from '@/components/LoginScreen'
-import Sidebar from '@/components/Sidebar'
-import Header from '@/components/Header'
-import TaskList from '@/components/TaskList'
-import TaskPanel from '@/components/TaskPanel'
+import Sidebar from '@/components/ui/Sidebar'
+import Header from '@/components/ui/Header'
+import TaskList from '@/components/ui/TaskList'
+import TaskPanel from '@/components/ui/TaskPanel'
 import CalendarWidget from '@/components/CalendarWidget'
 import WeeklyCalendar from '@/components/WeeklyCalendar'
-import BottomNav from '@/components/BottomNav'
+import BottomNav from '@/components/ui/BottomNav'
 
 // ─── Loading spinner ───────────────────────────────────────────────────────────
 function LoadingOverlay() {
